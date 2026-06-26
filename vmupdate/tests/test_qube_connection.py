@@ -20,6 +20,8 @@
 # USA.
 from unittest.mock import Mock, patch
 
+import qubesadmin.exc
+
 from vmupdate.qube_connection import QubeConnection
 
 
@@ -93,3 +95,31 @@ def test_do_not_shutdown_if_vm_was_already_running(shutdown_domains):
 
     vm.shutdown.assert_not_called()
     shutdown_domains.assert_not_called()
+
+
+@patch("vmupdate.qube_connection.shutdown_domains")
+def test_shutdown_error_does_not_propagate(shutdown_domains):
+    # A QubesException raised while shutting the clone down during teardown
+    # must not propagate (and mask an otherwise successful run).
+    vm = Mock()
+    vm.name = "hvm4"
+    vm.is_running.side_effect = [False, True]
+    vm.devices = {"pci": Mock()}
+    vm.devices["pci"].get_assigned_devices.return_value = []
+    vm.shutdown.side_effect = qubesadmin.exc.QubesException("boom")
+    status_notifier = Mock()
+    logger = Mock()
+
+    with QubeConnection(
+        vm,
+        "/tmp/qubes-update",
+        cleanup=False,
+        logger=logger,
+        show_progress=False,
+        status_notifier=status_notifier,
+    ):
+        pass
+
+    vm.shutdown.assert_called_once_with()
+    shutdown_domains.assert_not_called()
+    logger.error.assert_called_once()

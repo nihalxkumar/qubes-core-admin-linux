@@ -305,10 +305,12 @@ class TemplateUpgrader:
             dom0=False,
         )
         if result.code != EXIT.OK:
+            detail = (result.out or "").strip() or (result.err or "").strip()
             raise UpgradeError(
                 f"in-VM version-upgrade agent failed for "
                 f"{self.cloned_qube.name} (exit code {result.code}); "
                 f"see /var/log/qubes/update-{self.cloned_qube.name}.log"
+                + (f" -- {detail}" if detail else "")
             )
 
     def _build_agent_args(self) -> argparse.Namespace:
