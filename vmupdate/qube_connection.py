@@ -92,23 +92,16 @@ class QubeConnection:
                     str(err),
                 )
 
-        try:
-            if self.qube.is_running() and not self._initially_running:
-                if self._has_assigned_pci_devices(self.qube):
-                    self.logger.info(
-                        "Waiting for full shutdown %s (PCI devices assigned)",
-                        self.qube.name,
-                    )
-                    shutdown_domains([self.qube], self.logger)
-                else:
-                    self.logger.info("Shutdown %s", self.qube.name)
-                    self.qube.shutdown()
-        except Exception as err:  # pylint: disable=broad-except
-            self.logger.error(
-                "Cannot shutdown %s, because of error: %s",
-                self.qube.name,
-                str(err),
-            )
+        if self.qube.is_running() and not self._initially_running:
+            if self._has_assigned_pci_devices(self.qube):
+                self.logger.info(
+                    "Waiting for full shutdown %s (PCI devices assigned)",
+                    self.qube.name,
+                )
+                shutdown_domains([self.qube], self.logger)
+            else:
+                self.logger.info("Shutdown %s", self.qube.name)
+                self.qube.shutdown()
 
         self.__connected = False
 
