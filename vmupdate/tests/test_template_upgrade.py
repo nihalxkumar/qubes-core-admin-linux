@@ -1066,6 +1066,113 @@ def test_default_run_streams_output(monkeypatch, capsys) -> None:
     assert "Installing: bash" in capsys.readouterr().out
 
 
+# disk-space warning suppression around the agent run
+
+
+def _capture_disk_feature(captured, code=EXIT.OK):
+    """A fake update_qube that records the clone and the suppression
+    feature's value at the moment the agent runs."""
+
+    def fake_update_qube(
+        qube, agent_args, **kwargs
+    ) -> tuple[str, ProcessResult]:
+        captured["qube"] = qube
+        captured["during"] = qube.features.get(
+            template_upgrade.DISK_SPACE_NOTIFY_FEATURE
+        )
+        return qube.name, ProcessResult(code)
+
+    return fake_update_qube
+
+
+def test_disk_space_warning_suppressed_during_agent_run(monkeypatch) -> None:
+    """The clone's qui-disk-space warning is off while the agent runs and
+    the feature is absent again after a successful run."""
+    app = CloneApp()
+    add_template(app)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        template_upgrade, "update_qube", _capture_disk_feature(captured)
+    )
+
+    retcode = template_upgrade.main(["--template", "fedora-41"], app)
+
+    assert retcode == EXIT.OK
+    assert captured["during"] == "1"
+    clone = app.domains["fedora-42"]
+    assert template_upgrade.DISK_SPACE_NOTIFY_FEATURE not in clone.features
+
+
+def test_disk_space_warning_prior_value_restored(monkeypatch) -> None:
+    """A pre-existing feature value on the source (inherited by the clone)
+    is restored after the run instead of being deleted."""
+    app = CloneApp()
+    add_template(app, **{template_upgrade.DISK_SPACE_NOTIFY_FEATURE: "0"})
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        template_upgrade, "update_qube", _capture_disk_feature(captured)
+    )
+
+    retcode = template_upgrade.main(["--template", "fedora-41"], app)
+
+    assert retcode == EXIT.OK
+    assert captured["during"] == "1"
+    clone = app.domains["fedora-42"]
+    assert clone.features[template_upgrade.DISK_SPACE_NOTIFY_FEATURE] == "0"
+
+
+def test_disk_space_warning_restored_on_agent_failure(monkeypatch) -> None:
+    """The finally path restores the feature even when the agent fails."""
+    app = CloneApp()
+    add_template(app)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        template_upgrade,
+        "update_qube",
+        _capture_disk_feature(captured, code=EXIT.ERR_VM_UPDATE),
+    )
+
+    retcode = template_upgrade.main(
+        ["--template", "fedora-41", "--keep-new-on-failure"], app
+    )
+
+    assert retcode == EXIT.ERR
+    assert captured["during"] == "1"
+    clone = captured["qube"]
+    assert template_upgrade.DISK_SPACE_NOTIFY_FEATURE not in clone.features
+
+
+def test_disk_space_suppression_failure_does_not_block_agent(
+    monkeypatch,
+) -> None:
+    """If setting the feature raises, the agent still runs and the upgrade succeeds."""
+
+    class BoomFeatures(dict):
+        def __setitem__(self, key, value) -> None:
+            if key == template_upgrade.DISK_SPACE_NOTIFY_FEATURE:
+                raise qubesadmin.exc.QubesException("features unavailable")
+            super().__setitem__(key, value)
+
+    class BoomApp(CloneApp):
+        def clone_vm(self, source_vm, new_name) -> _TestVM:
+            clone = super().clone_vm(source_vm, new_name)
+            clone.features = BoomFeatures(clone.features)
+            return clone
+
+    app = BoomApp()
+    add_template(app)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        template_upgrade, "update_qube", _capture_disk_feature(captured)
+    )
+
+    retcode = template_upgrade.main(["--template", "fedora-41"], app)
+
+    assert retcode == EXIT.OK
+    assert captured["during"] is None  # never got suppressed
+    assert captured["qube"].name == "fedora-42"
+
+
 # --log argument
 
 

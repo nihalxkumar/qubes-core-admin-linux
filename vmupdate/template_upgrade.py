@@ -2,6 +2,7 @@
 """Upgrade a clone to the next distro release."""
 
 import argparse
+import contextlib
 import logging
 import re
 import sys
@@ -9,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Optional, Sequence, Tuple
+from typing import Iterator, Optional, Sequence, Tuple
 
 import qubesadmin
 import qubesadmin.app
@@ -36,6 +37,9 @@ SUPPORTED_CLASSES = {"TemplateVM", "StandaloneVM"}
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 # Mark templates created by this tool.
 REPONAME = "@qvm-template-upgrade"
+
+# qui-disk-space's per-qube "running out of storage space" warning.
+DISK_SPACE_NOTIFY_FEATURE = "disk-space-not-notify"
 
 
 class UpgradeError(Exception):
@@ -395,6 +399,35 @@ class TemplateUpgrader:
         self.log.info("Cloning %s -> %s", self.source_vm.name, self.new_name)
         self.cloned_qube = self.app.clone_vm(self.source_vm, self.new_name)
 
+    @contextlib.contextmanager
+    def _disk_space_warning_suppressed(self) -> Iterator[None]:
+        """Temporarily suppress qui-disk-space during upgrade.
+
+        The upgrade briefly holds both releases' packages, which can
+        trip the 90% threshold. This may bring unnecesarry panic for users.
+        """
+        try:
+            prior = self.cloned_qube.features.get(DISK_SPACE_NOTIFY_FEATURE)
+            self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE] = "1"
+        except qubesadmin.exc.QubesException as err:
+            self.log.warning("could not suppress disk space warning: %s", err)
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                if prior is None:
+                    del self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE]
+                else:
+                    self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE] = (
+                        prior
+                    )
+            except (KeyError, qubesadmin.exc.QubesException) as err:
+                self.log.warning(
+                    "could not restore disk space warning: %s", err
+                )
+
     def run_agent(self) -> None:
         """Run the version-upgrade agent inside the clone."""
         agent_args = self._build_agent_args()
@@ -414,19 +447,20 @@ class TemplateUpgrader:
         )
         termination = SimpleNamespace(value=False)
 
-        status_notifier.start()
-        try:
-            _name, result = update_qube(
-                self.cloned_qube,
-                agent_args,
-                show_progress=True,
-                status_notifier=status_notifier,
-                termination=termination,
-                dom0=False,
-            )
-        finally:
-            # Finish the bar before any later output.
-            status_notifier.close()
+        with self._disk_space_warning_suppressed():
+            status_notifier.start()
+            try:
+                _name, result = update_qube(
+                    self.cloned_qube,
+                    agent_args,
+                    show_progress=True,
+                    status_notifier=status_notifier,
+                    termination=termination,
+                    dom0=False,
+                )
+            finally:
+                # Finish the bar before any later output.
+                status_notifier.close()
         if result.code != EXIT.OK:
             raise UpgradeError(
                 f"in-VM version-upgrade agent failed for "
