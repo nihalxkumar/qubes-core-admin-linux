@@ -20,6 +20,7 @@
 # USA.
 
 import os
+import time
 import subprocess
 from logging import Handler, Logger
 from typing import Iterable
@@ -164,6 +165,74 @@ class DNF(DNFCLI):
         finally:
             self.base.close()
 
+        return result
+
+    def _distro_sync(self, target: str) -> ProcessResult:
+        """Run release upgrade via DNF API with callback progress reporting."""
+        print(
+            "Preparing distribution upgrade; dependency calculation may "
+            "take some time...",
+            flush=True,
+        )
+        result = ProcessResult()
+        try:
+            conf = dnf.conf.Conf()
+            conf.read()
+            # mirror the CLI flags: --best (--allowerasing is set on
+            # resolve below)
+            conf.best = True
+            conf.substitutions["releasever"] = target
+            base = dnf.Base(conf)
+            try:
+                base.read_all_repos()
+                fill_sack_started = time.monotonic()
+                base.fill_sack()
+                self.log.debug(
+                    "dnf fill_sack for release %s took %.3fs",
+                    target,
+                    time.monotonic() - fill_sack_started,
+                )
+                base.distro_sync()
+                # fill empty `Command line` column in dnf history
+                base.cmds = ["qubes-vm-update"]
+                print("Calculating package changes...", flush=True)
+                resolve_started = time.monotonic()
+                base.resolve(allow_erasing=True)
+                self.log.debug(
+                    "dnf dependency resolution for release %s took %.3fs",
+                    target,
+                    time.monotonic() - resolve_started,
+                )
+                trans = base.transaction
+                if not trans:
+                    self.log.info("Distro-sync found nothing to do.")
+                    return result
+                download_started = time.monotonic()
+                base.download_packages(
+                    trans.install_set, progress=self.progress.fetch_progress
+                )
+                self.log.debug(
+                    "dnf package download for release %s took %.3fs",
+                    target,
+                    time.monotonic() - download_started,
+                )
+                result += sign_check(base, trans.install_set, self.log)
+                if result.code == EXIT.OK:
+                    self.log.debug("Committing distro-sync to %s...", target)
+                    transaction_started = time.monotonic()
+                    base.do_transaction(self.progress.upgrade_progress)
+                    self.log.debug(
+                        "dnf transaction for release %s took %.3fs",
+                        target,
+                        time.monotonic() - transaction_started,
+                    )
+            finally:
+                base.close()
+        except Exception as exc:
+            self.log.error(
+                "An error occurred during release upgrade: %s", str(exc)
+            )
+            result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=str(exc))
         return result
 
 

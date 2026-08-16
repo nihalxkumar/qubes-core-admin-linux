@@ -20,6 +20,7 @@
 # USA.
 
 import os
+import time
 from pathlib import Path
 from logging import Handler, Logger
 
@@ -64,11 +65,26 @@ class APT(APTCLI):
         result = ProcessResult()
         try:
             self.log.debug("Refreshing available packages...")
+            # Reload sources after a release upgrade because apt.Cache retains
+            # the SourceList that open() read.
+            cache_open_started = time.monotonic()
+            self.apt_cache.open()
+            self.log.debug(
+                "APT cache reload before refresh took %.3fs",
+                time.monotonic() - cache_open_started,
+            )
             success = self.apt_cache.update(
                 self.progress.update_progress,
                 pulse_interval=1000,  # microseconds
             )
+            # Reload the package cache again to consume the indexes fetched
+            # by update().
+            cache_open_started = time.monotonic()
             self.apt_cache.open()
+            self.log.debug(
+                "APT cache reload after refresh took %.3fs",
+                time.monotonic() - cache_open_started,
+            )
             if success:
                 self.log.debug("Cache refresh successful.")
             else:
@@ -86,10 +102,45 @@ class APT(APTCLI):
         """
         Use `apt` package to upgrade and track progress.
         """
+        result = self._api_upgrade(dist_upgrade=remove_obsolete)
+
+        if remove_obsolete:
+            result += self.remove_obsolete_kernels()
+
+        return result
+
+    def _dist_upgrade(self) -> ProcessResult:
+        """Run API dist-upgrade with callback progress reporting."""
+        print(
+            "Preparing distribution upgrade; dependency calculation may take "
+            "some time...",
+            flush=True,
+        )
+        # Reload the stale cache before marking distribution changes.
+        cache_open_started = time.monotonic()
+        self.apt_cache.open()
+        self.log.debug(
+            "APT cache reload before distribution upgrade took %.3fs",
+            time.monotonic() - cache_open_started,
+        )
+        return self._api_upgrade(dist_upgrade=True)
+
+    def _api_upgrade(self, dist_upgrade: bool) -> ProcessResult:
+        """
+        Mark an upgrade (or dist-upgrade) in the apt cache and commit it
+        with callback-driven fetch and install progress.
+        """
         result = ProcessResult()
         try:
             self.log.debug("Performing package upgrade...")
-            self.apt_cache.upgrade(dist_upgrade=remove_obsolete)
+            print("Calculating package changes...", flush=True)
+            dependency_started = time.monotonic()
+            self.apt_cache.upgrade(dist_upgrade=dist_upgrade)
+            self.log.debug(
+                "APT dependency calculation (dist_upgrade=%s) took %.3fs",
+                dist_upgrade,
+                time.monotonic() - dependency_started,
+            )
             Path(
                 os.path.join(
                     apt_pkg.config.find_dir("Dir::Cache::Archives"), "partial"
@@ -98,8 +149,13 @@ class APT(APTCLI):
             apt_pkg.config.set("Dpkg::Options::", "--force-confdef")
             apt_pkg.config.set("Dpkg::Options::", "--force-confold")
             self.log.debug("Committing upgrade...")
+            commit_started = time.monotonic()
             self.apt_cache.commit(
                 self.progress.fetch_progress, self.progress.upgrade_progress
+            )
+            self.log.debug(
+                "APT package commit took %.3fs",
+                time.monotonic() - commit_started,
             )
             self.log.debug("Package upgrade successful.")
         except Exception as exc:
@@ -108,17 +164,18 @@ class APT(APTCLI):
             )
             result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=str(exc))
 
-        if remove_obsolete:
-            result += self.remove_obsolete_kernels()
-
         return result
 
 
 class FetchProgress(apt.progress.base.AcquireProgress, Progress):
+    # Report fetch progress while apt provides no percentage.
+    REPORT_INTERVAL = 30
+
     def __init__(self, weight: int, log: Logger, refresh: bool = False) -> None:
         Progress.__init__(self, weight, log)
         self.action = "refresh" if refresh else "fetch"
         self.fetching_notified = False
+        self._last_report = 0.0
 
     def fail(self, item: apt_pkg.AcquireItemDesc) -> None:
         """
@@ -140,6 +197,7 @@ class FetchProgress(apt.progress.base.AcquireProgress, Progress):
         This function returns a boolean value indicating whether the
         acquisition should be continued (True) or cancelled (False).
         """
+        now = time.monotonic()
         if self.action == "fetch" and not self.fetching_notified:
             print(
                 f"Fetching {self.total_items} packages "
@@ -147,12 +205,24 @@ class FetchProgress(apt.progress.base.AcquireProgress, Progress):
                 flush=True,
             )
             self.fetching_notified = True
+            self._last_report = now
+        elif now - self._last_report >= self.REPORT_INTERVAL:
+            print(
+                f"{self.action.capitalize()}ing "
+                f"{self._format_bytes(self.current_bytes)} of "
+                f"{self._format_bytes(self.total_bytes)}...",
+                flush=True,
+            )
+            self._last_report = now
         self.notify_callback(self.current_bytes / self.total_bytes * 100)
         return True
 
     def start(self) -> None:
         """Invoked when the Acquire process starts running."""
         self.log.info(f"{self.action.capitalize()} started.")
+        # Re-arm the fetch notice for each acquire run.
+        self.fetching_notified = False
+        self._last_report = time.monotonic()
         if self.action == "refresh":
             print("Refreshing available packages.", flush=True)
         super().start()

@@ -21,8 +21,9 @@
 # USA.
 
 import subprocess
+import time
 from logging import Logger, Handler
-from typing import Any
+from typing import Any, Optional
 
 import libdnf5
 from libdnf5.repo import DownloadCallbacks
@@ -164,6 +165,114 @@ class DNF5(DNFCLI):
             result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=str(exc))
         return result
 
+    def _distro_sync(self, target: str) -> ProcessResult:
+        """Run distro-sync with libdnf5 and report API progress.
+
+        Use a fresh base for the target releasever.
+        """
+        print(
+            "Preparing distribution upgrade; dependency calculation may "
+            "take some time...",
+            flush=True,
+        )
+        result = ProcessResult()
+        try:
+            base = libdnf5.base.Base()
+            base.load_config()
+            base.get_config().best = True  # mirror the CLI --best flag
+            # Set releasever before setup to prevent old-release detection.
+            base.get_vars().set("releasever", target)
+            base.setup()
+
+            repo_sack = base.get_repo_sack()
+            repo_sack.create_repos_from_system_configuration()
+            base.set_download_callbacks(
+                libdnf5.repo.DownloadCallbacksUniquePtr(
+                    self.progress.fetch_progress
+                )
+            )
+            load_started = time.monotonic()
+            repo_sack.load_repos()
+            self.log.debug(
+                "dnf5 repo load for release %s took %.3fs",
+                target,
+                time.monotonic() - load_started,
+            )
+
+            goal = Goal(base)
+            goal.set_allow_erasing(True)  # mirror --allowerasing
+            goal.add_rpm_distro_sync()
+            print("Calculating package changes...", flush=True)
+            resolve_started = time.monotonic()
+            transaction = goal.resolve()
+            self.log.debug(
+                "dnf5 dependency resolution for release %s took %.3fs",
+                target,
+                time.monotonic() - resolve_started,
+            )
+            # fill empty `Command line` column in dnf history
+            transaction.set_description("qubes-vm-update")
+
+            if transaction.get_transaction_packages_count() == 0:
+                self.log.info("Distro-sync found nothing to do.")
+                return result
+
+            # Size the download before it starts; see expect_bytes().
+            self.progress.fetch_progress.expect_bytes(
+                planned_download_bytes(transaction, self.log)
+            )
+            download_started = time.monotonic()
+            transaction.download()
+            self.log.debug(
+                "dnf5 package download for release %s took %.3fs",
+                target,
+                time.monotonic() - download_started,
+            )
+            if not transaction.check_gpg_signatures():
+                problems = transaction.get_gpg_signature_problems()
+                raise TransactionError(
+                    f"GPG signatures check failed: {problems}"
+                )
+
+            self.log.debug("Committing distro-sync to %s...", target)
+            transaction.set_callbacks(
+                libdnf5.rpm.TransactionCallbacksUniquePtr(
+                    self.progress.upgrade_progress
+                )
+            )
+            transaction_started = time.monotonic()
+            tnx_result = transaction.run()
+            self.log.debug(
+                "dnf5 transaction for release %s took %.3fs",
+                target,
+                time.monotonic() - transaction_started,
+            )
+            if tnx_result != transaction.TransactionRunResult_SUCCESS:
+                raise TransactionError(
+                    transaction.transaction_result_to_string(tnx_result)
+                )
+        except Exception as exc:
+            self.log.error(
+                "An error occurred during release upgrade: %s", str(exc)
+            )
+            result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=str(exc))
+        return result
+
+
+def planned_download_bytes(transaction, log: Logger) -> float:
+    """Return package bytes to download, or 0 when unavailable."""
+    try:
+        is_inbound = libdnf5.base.transaction.transaction_item_action_is_inbound
+        total = 0.0
+        for item in transaction.get_transaction_packages():
+            # Exclude erased and replaced entries from the download total.
+            if is_inbound(item.get_action()):
+                total += item.get_package().get_download_size()
+        return total
+    except Exception:  # pylint: disable=broad-except
+        log.debug("cannot size the download up front", exc_info=True)
+        return 0.0
+
 
 class FetchProgress(DownloadCallbacks, Progress):
     def __init__(self, weight: int, log: Logger) -> None:
@@ -171,10 +280,24 @@ class FetchProgress(DownloadCallbacks, Progress):
         Progress.__init__(self, weight, log)
         self.bytes_to_fetch = 0.0
         self.bytes_fetched = 0.0
+        self.expected_bytes = 0.0
         self.package_bytes: dict[int, float] = {}
         self.package_names: dict[int, str] = {}
         self.count = 0
         self.fetching_notified = False
+
+    def expect_bytes(self, total: float) -> None:
+        """Reset download counters and set the expected package download size."""
+        self.bytes_fetched = 0.0
+        self.bytes_to_fetch = 0.0
+        self.fetching_notified = False
+        if total > 0:
+            self.expected_bytes = float(total)
+
+    @property
+    def download_total(self) -> float:
+        """Return the expected or accumulated download total, whichever is larger."""
+        return max(self.bytes_to_fetch, self.expected_bytes)
 
     def add_new_download(
         self, _user_data: Any, description: str, total_to_download: float
@@ -188,7 +311,10 @@ class FetchProgress(DownloadCallbacks, Progress):
         :return: Associated user data for new download.
         """
         self.count += 1
-        self.bytes_to_fetch += total_to_download
+        # libdnf5 reports unknown sizes as -1; don't let those poison the
+        # total (e.g. "Fetching 4 packages [-4.00 B]").
+        if total_to_download > 0:
+            self.bytes_to_fetch += total_to_download
         self.package_bytes[self.count] = 0
         self.package_names[self.count] = description
         # downloading is not started yet
@@ -208,21 +334,27 @@ class FetchProgress(DownloadCallbacks, Progress):
         if not self.fetching_notified:
             print(
                 f"Fetching {self.count} packages "
-                f"[{self._format_bytes(self.bytes_to_fetch)}]",
+                f"[{self._format_bytes(self.download_total)}]",
                 flush=True,
             )
             self.fetching_notified = True
         self.bytes_fetched += downloaded - self.package_bytes[user_cb_data]
         if downloaded > self.package_bytes[user_cb_data]:
             if self.package_bytes[user_cb_data] == 0:
+                size = (
+                    self._format_bytes(total_to_download)
+                    if total_to_download > 0
+                    else "unknown size"
+                )
                 print(
-                    f"Fetching {self.package_names[user_cb_data]} "
-                    f"[{self._format_bytes(total_to_download)}]",
+                    f"Fetching {self.package_names[user_cb_data]} [{size}]",
                     flush=True,
                 )
             self.package_bytes[user_cb_data] = downloaded
-            percent = self.bytes_fetched / self.bytes_to_fetch * 100
-            self.notify_callback(percent)
+            # Do not divide by an unknown-size total.
+            total = self.download_total
+            if total > 0:
+                self.notify_callback(min(self.bytes_fetched / total * 100, 100))
         # Should return 0 on success,
         # in case anything in dnf5 changed we return their default value
         return DownloadCallbacks.progress(
@@ -245,7 +377,7 @@ class FetchProgress(DownloadCallbacks, Progress):
         return DownloadCallbacks.end(self, user_cb_data, status, msg)
 
     def mirror_failure(
-        self, user_cb_data: int, msg: str, url: str, metadata: str
+        self, user_cb_data: int, msg: str, url: str, metadata: Optional[str]
     ) -> int:
         """
         Mirror failure callback.
@@ -257,8 +389,10 @@ class FetchProgress(DownloadCallbacks, Progress):
         """
         if isinstance(msg, bytes):
             msg = msg.decode("ascii", errors="ignore")
+        # libdnf5 passes no metadata type for plain package downloads
+        # (avoid "Fetching None failure (...)").
         print(
-            f"Fetching {metadata} failure "
+            f"Fetching {metadata or 'package'} failure "
             f"({self.package_names[user_cb_data]}) {msg}",
             flush=True,
             file=self._stdout,

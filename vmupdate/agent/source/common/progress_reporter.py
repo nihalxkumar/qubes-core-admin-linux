@@ -105,11 +105,20 @@ class ProgressReporter:
         self.stderr = io.TextIOWrapper(os.fdopen(saved_stderr, "wb"))
         self.last_percent = 0.0
         if callback is None:
-            self.callback = lambda p: print(
+            emit: Callable[[float], None] = lambda p: print(
                 f"{p:.2f}", flush=True, file=self.stderr
             )
         else:
-            self.callback = callback
+            emit = callback
+
+        def callback_with_memory(percent: float) -> None:
+            # Remember the highest value reported so far, so callers can
+            # tell whether the stream already reached 100 and skip a
+            # duplicate final milestone (PackageManager._finish_progress).
+            self.last_percent = max(self.last_percent, percent)
+            emit(percent)
+
+        self.callback = callback_with_memory
 
         total = update.weight + fetch.weight + upgrade.weight
         update_end = update.weight / total * 100

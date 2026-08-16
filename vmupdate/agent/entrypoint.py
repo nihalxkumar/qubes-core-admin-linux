@@ -40,15 +40,35 @@ def main(args: list[str] | None = None) -> int:
         parsed_args.no_progress,
     )
 
-    log.debug("Running upgrades.")
-    return_code = pkg_mng.upgrade(
-        refresh=not parsed_args.no_refresh,
-        hard_fail=not parsed_args.force_upgrade,
-        remove_obsolete=not parsed_args.leave_obsolete,
-        print_streams=parsed_args.show_output,
-    )
+    if parsed_args.version_upgrade:
+        log.debug(
+            "Running distribution version upgrade to %s.",
+            parsed_args.version_upgrade,
+        )
+        try:
+            return_code = pkg_mng.version_upgrade(
+                parsed_args.version_upgrade,
+                print_streams=parsed_args.show_output,
+            )
+        except NotImplementedError as err:
+            log.error("Distribution version upgrade failed: %s", err)
+            print(str(err), file=sys.stderr)
+            return_code = EXIT.ERR_VM_UPDATE
+    else:
+        log.debug("Running upgrades.")
+        return_code = pkg_mng.upgrade(
+            refresh=not parsed_args.no_refresh,
+            hard_fail=not parsed_args.force_upgrade,
+            remove_obsolete=not parsed_args.leave_obsolete,
+            print_streams=parsed_args.show_output,
+        )
 
-    if not pkg_mng.PROGRESS_REPORTING and not parsed_args.no_progress:
+    # Version upgrades handle their own milestones; this is for normal updates only.
+    if (
+        not parsed_args.version_upgrade
+        and not pkg_mng.PROGRESS_REPORTING
+        and not parsed_args.no_progress
+    ):
         # even if progress reporting is unavailable we want info that update finished
         if agent_type is AgentType.UPDATE_VM:
             print(f"{55:.2f}", flush=True, file=sys.stderr)
