@@ -28,6 +28,10 @@ import enum
 from typing import Optional, Dict, List, Any
 from .process_result import ProcessResult
 from .exit_codes import EXIT
+from .progress_reporter import ReleaseUpgradeTail
+
+# Where a release upgrade leaves the bar before qubes.PostInstall runs.
+RELEASE_UPGRADE_ALMOST_DONE = ReleaseUpgradeTail.TAIL_STOP
 
 
 class AgentType(enum.Enum):
@@ -110,6 +114,10 @@ class PackageManager:
                     "(qvm-features) will refresh on next qube start.",
                     postinstall,
                 )
+        if result.code == EXIT.OK:
+            # After qubes.PostInstall, whose fstrim runs long enough that
+            # reporting 100 first leaves the bar apparently stuck.
+            self._finish_progress()
         self._log_output("version-upgrade", result)
         # Do not duplicate output that already streamed live.
         if print_streams and not result.posted:
@@ -399,16 +407,20 @@ class PackageManager:
         """
         print(f"{percent:.2f}", flush=True, file=sys.stderr)
 
-    def _finish_progress(self) -> None:
-        """Report completion unless callback progress already reached 100.
-
-        dom0 reads everything after the first 100 as error text, so a second
-        one surfaces as a bogus "err: 100.00" line.
+    def _report_milestone(self, percent: float) -> None:
+        """
+        Report `percent` unless callback progress already passed it.
         """
         progress = getattr(self, "progress", None)
-        if progress is not None and progress.last_percent >= 100:
-            return
-        self._report_progress(100.0)
+        if progress is not None:
+            if progress.last_percent >= percent:
+                return
+            progress.last_percent = percent
+        self._report_progress(percent)
+
+    def _finish_progress(self) -> None:
+        """Report 100% completion if not already reported."""
+        self._report_milestone(100.0)
 
     def clean(self) -> int:
         """

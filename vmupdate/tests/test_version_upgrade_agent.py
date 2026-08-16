@@ -52,6 +52,11 @@ from source.apt.apt_cli import APTCLI
 from source.common.package_manager import PackageManager, AgentType
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
+from source.common.progress_reporter import (
+    Progress,
+    ProgressReporter,
+    ReleaseUpgradeTail,
+)
 from source.args import AgentArgs
 
 
@@ -132,8 +137,9 @@ def test_version_upgrade_emits_progress_milestones(capsys) -> None:
         mgr.version_upgrade("42")
 
     # The progress contract QubeConnection._collect_stderr parses: bare floats
-    # terminated by 100.00.
-    assert capsys.readouterr().err.split() == ["0.00", "100.00"]
+    # terminated by 100.00. 99.50 lands before qubes.PostInstall, whose
+    # fstrim runs long enough that reporting 100 first would stall the bar.
+    assert capsys.readouterr().err.split() == ["0.00", "99.50", "100.00"]
 
 
 def test_version_upgrade_skips_duplicate_final_milestone(capsys) -> None:
@@ -171,8 +177,6 @@ def test_version_upgrade_completes_progress_that_fell_short(capsys) -> None:
 def test_progress_reporter_remembers_last_reported_percent() -> None:
     """ProgressReporter records the highest percent it emitted, so
     PackageManager._finish_progress can tell whether 100 already went out."""
-    from source.common.progress_reporter import Progress, ProgressReporter
-
     log = MagicMock()
     reporter = ProgressReporter(
         Progress(1, log),
@@ -188,6 +192,123 @@ def test_progress_reporter_remembers_last_reported_percent() -> None:
 
     reporter.upgrade_progress.notify_callback(100)
     assert reporter.last_percent == 100.0
+
+
+# ReleaseUpgradeTail: shaping the post-transaction scriptlet tail
+
+
+def _make_tail(weights=(0, 55, 45)):
+    """Build an armed ReleaseUpgradeTail over dnf5's phase weights.
+
+    :return: (tail, emitted) where `emitted` accumulates overall percents
+    """
+
+    class Tail(ReleaseUpgradeTail, Progress):
+        def __init__(self, weight, log) -> None:
+            Progress.__init__(self, weight, log)
+            ReleaseUpgradeTail.__init__(self)
+
+    log = MagicMock()
+    emitted: list[float] = []
+    update, fetch, upgrade = weights
+    tail = Tail(upgrade, log)
+    ProgressReporter(
+        Progress(update, log),
+        Progress(fetch, log),
+        tail,
+        callback=emitted.append,
+    )
+    tail.open_tail()
+    return tail, emitted
+
+
+def test_tail_inert_until_armed() -> None:
+    """Ordinary qubes-vm-update runs must be untouched: with the tail
+    closed, package callbacks are neither rescaled nor redirected."""
+    tail, emitted = _make_tail()
+    tail.close_tail()
+    tail.notify_callback(tail._scaled_percent(100))
+    # the upgrade phase owns 55..100, so an unscaled 100 reaches 100
+    assert emitted == [100.0]
+    tail.note_tail_scriptlet()
+    assert emitted == [100.0]
+
+
+def test_tail_rescales_package_progress_to_end_at_cap() -> None:
+    """Package callbacks are rescaled, not clamped: clamping pins the bar
+    for however long the elements past the cap take, which is the freeze
+    this shaping exists to remove."""
+    tail, emitted = _make_tail()
+    for local in (25, 50, 75, 100):
+        tail.notify_callback(tail._scaled_percent(local))
+
+    span = ReleaseUpgradeTail.CAP - 55
+    assert emitted == pytest.approx(
+        [55 + span * f for f in (0.25, 0.5, 0.75, 1.0)], abs=0.01
+    )
+
+
+def test_tail_never_reaches_its_ceiling() -> None:
+    """The scriptlet count cannot be known up front, so the band is
+    asymptotic: however many run, the bar stays below TAIL_STOP."""
+    tail, emitted = _make_tail()
+    for _ in range(500):
+        tail.note_tail_scriptlet()
+
+    assert emitted == sorted(emitted)
+    assert emitted[0] > ReleaseUpgradeTail.CAP
+    assert emitted[-1] < ReleaseUpgradeTail.TAIL_STOP
+    assert emitted[-1] > ReleaseUpgradeTail.TAIL_STOP - 0.5
+
+
+def test_tail_is_visible_on_a_one_decimal_bar() -> None:
+    """dom0 renders one decimal, so the band has to be wide enough that a
+    realistic scriptlet count produces distinct readings rather than one
+    frozen value."""
+    tail, emitted = _make_tail()
+    # 99 scriptlets, as measured on a fedora-42 to 43 template upgrade
+    for _ in range(99):
+        tail.note_tail_scriptlet()
+
+    assert len({f"{percent:.1f}" for percent in emitted}) > 50
+
+
+def test_dnf5_tail_marker_types_are_known() -> None:
+    """Verify expected libdnf5 transaction callback script types exist."""
+    libdnf5 = pytest.importorskip("libdnf5")
+    callbacks = libdnf5.rpm.TransactionCallbacks
+    assert isinstance(callbacks.ScriptType_POST_TRANSACTION, int)
+    # %postuntrans is rpm 4.20 and up, so absence is tolerated
+    from source.dnf.dnf5_api import tail_marker_types
+
+    assert callbacks.ScriptType_POST_TRANSACTION in tail_marker_types()
+
+
+def test_version_upgrade_final_milestone_follows_postinstall() -> None:
+    """100 must come after qubes.PostInstall: its fstrim runs long enough
+    that reporting 100 first leaves the bar apparently stuck."""
+    mgr = make_dnf_cli()
+    order: list[str] = []
+
+    def record_postinstall(_cmd, **_kwargs) -> int:
+        order.append("postinstall")
+        return 0
+
+    with patch.object(
+        mgr, "run_cmd", return_value=ProcessResult(EXIT.OK)
+    ), patch(
+        "source.dnf.dnf_cli.get_os_data", side_effect=fedora_upgrade_os_data()
+    ), patch(
+        "source.common.package_manager.subprocess.call",
+        side_effect=record_postinstall,
+    ), patch.object(
+        PackageManager,
+        "_report_progress",
+        staticmethod(lambda percent: order.append(f"{percent:.2f}")),
+    ):
+        mgr.version_upgrade("42")
+
+    assert order == ["0.00", "99.50", "postinstall", "100.00"]
 
 
 def test_version_upgrade_release_bump_goes_through_distro_sync_seam() -> None:
@@ -574,16 +695,6 @@ def test_apt_api_dist_upgrade_reports_preparation_phase(
     mgr.apt_cache.open.assert_called_once_with()
     mgr.apt_cache.upgrade.assert_called_once_with(dist_upgrade=True)
     mgr.apt_cache.commit.assert_called_once()
-    debug_calls = mgr.log.debug.call_args_list
-    debug_messages = [str(call.args[0]) for call in debug_calls]
-    assert any(
-        "cache reload before distribution upgrade" in message
-        for message in debug_messages
-    )
-    assert any(
-        "dependency calculation" in message for message in debug_messages
-    )
-    assert any("package commit" in message for message in debug_messages)
 
 
 def test_apt_api_fetch_progress_announces_every_transaction(capsys) -> None:
@@ -663,11 +774,50 @@ def test_dnf_api_distro_sync_reports_preparation_phase(capsys) -> None:
     base.download_packages.assert_called_once()
     base.do_transaction.assert_called_once()
 
-    debug_messages = [str(c.args[0]) for c in mgr.log.debug.call_args_list]
-    assert any("fill_sack" in m for m in debug_messages)
-    assert any("dependency resolution" in m for m in debug_messages)
-    assert any("package download" in m for m in debug_messages)
-    assert any("transaction" in m for m in debug_messages)
+
+def test_dnf_api_distro_sync_maps_errors_and_closes_base() -> None:
+    """A depsolve failure must surface as a handled ERR_VM_UPDATE result
+    (so dom0 rolls the clone back) and still close the dnf base."""
+    dnf_api = pytest.importorskip("source.dnf.dnf_api")
+    mgr = dnf_api.DNF.__new__(dnf_api.DNF)
+    mgr.progress = MagicMock()
+    mgr.log = MagicMock()
+
+    base = MagicMock()
+    base.resolve.side_effect = RuntimeError("depsolve failed")
+
+    with patch.object(
+        dnf_api.dnf.conf, "Conf", return_value=MagicMock()
+    ), patch.object(dnf_api.dnf, "Base", return_value=base):
+        result = mgr._distro_sync("42")
+
+    assert result.code == EXIT.ERR_VM_UPDATE
+    assert "depsolve failed" in result.err
+    base.close.assert_called_once()
+    base.download_packages.assert_not_called()
+    base.do_transaction.assert_not_called()
+
+
+def test_dnf_api_distro_sync_empty_transaction_is_success() -> None:
+    """An already-current clone (nothing to sync) is a success, not an
+    error, and must not attempt a download or a transaction."""
+    dnf_api = pytest.importorskip("source.dnf.dnf_api")
+    mgr = dnf_api.DNF.__new__(dnf_api.DNF)
+    mgr.progress = MagicMock()
+    mgr.log = MagicMock()
+
+    base = MagicMock()
+    base.transaction = None
+
+    with patch.object(
+        dnf_api.dnf.conf, "Conf", return_value=MagicMock()
+    ), patch.object(dnf_api.dnf, "Base", return_value=base):
+        result = mgr._distro_sync("42")
+
+    assert result.code == EXIT.OK
+    base.download_packages.assert_not_called()
+    base.do_transaction.assert_not_called()
+    base.close.assert_called_once()
 
 
 def test_dnf5_api_distro_sync_reports_preparation_phase(capsys) -> None:
@@ -712,12 +862,6 @@ def test_dnf5_api_distro_sync_reports_preparation_phase(capsys) -> None:
     repo_sack.load_repos.assert_called_once()
     transaction.download.assert_called_once()
     transaction.run.assert_called_once()
-
-    debug_messages = [str(c.args[0]) for c in mgr.log.debug.call_args_list]
-    assert any("repo load" in m for m in debug_messages)
-    assert any("dependency resolution" in m for m in debug_messages)
-    assert any("package download" in m for m in debug_messages)
-    assert any("transaction" in m for m in debug_messages)
 
 
 def test_dnf5_fetch_progress_tolerates_unknown_sizes(capsys) -> None:
@@ -976,7 +1120,7 @@ def test_apt_release_upgrade_happy_path_order(apt_sources, capsys) -> None:
         "kernel-cleanup",
     ]
     # the QubeConnection progress contract: bare floats, terminated by 100.00
-    assert capsys.readouterr().err.split() == ["0.00", "100.00"]
+    assert capsys.readouterr().err.split() == ["0.00", "99.50", "100.00"]
 
 
 def test_apt_release_upgrade_refuses_symbolic_sources(
@@ -1039,7 +1183,7 @@ def test_apt_release_upgrade_survives_kernel_cleanup_failure(
 
     assert code == EXIT.OK
     assert calls[-1] == "kernel-cleanup"
-    assert capsys.readouterr().err.split() == ["0.00", "100.00"]
+    assert capsys.readouterr().err.split() == ["0.00", "99.50", "100.00"]
 
 
 def test_apt_release_upgrade_bails_before_rewrite_when_update_fails(

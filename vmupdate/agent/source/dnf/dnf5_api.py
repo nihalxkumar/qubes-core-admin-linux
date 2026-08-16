@@ -32,7 +32,11 @@ from libdnf5.base import Goal
 
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
-from source.common.progress_reporter import ProgressReporter, Progress
+from source.common.progress_reporter import (
+    ProgressReporter,
+    Progress,
+    ReleaseUpgradeTail,
+)
 from source.common.package_manager import AgentType
 
 from .dnf_cli import DNFCLI
@@ -240,8 +244,14 @@ class DNF5(DNFCLI):
                     self.progress.upgrade_progress
                 )
             )
+            # The post-transaction scriptlets run for minutes after the
+            # last package installs. See ReleaseUpgradeTail.
+            self.progress.upgrade_progress.open_tail()
             transaction_started = time.monotonic()
-            tnx_result = transaction.run()
+            try:
+                tnx_result = transaction.run()
+            finally:
+                self.progress.upgrade_progress.close_tail()
             self.log.debug(
                 "dnf5 transaction for release %s took %.3fs",
                 target,
@@ -257,6 +267,16 @@ class DNF5(DNFCLI):
             )
             result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=str(exc))
         return result
+
+
+def tail_marker_types() -> frozenset[int]:
+    """Return libdnf5 ScriptType values marking the start of post-transaction scriptlets."""
+    names = ("ScriptType_POST_TRANSACTION", "ScriptType_POSTUN_TRANSACTION")
+    values = (getattr(TransactionCallbacks, name, None) for name in names)
+    return frozenset(int(v) for v in values if isinstance(v, int))
+
+
+TAIL_MARKER_TYPES = tail_marker_types()
 
 
 def planned_download_bytes(transaction, log: Logger) -> float:
@@ -402,13 +422,16 @@ class FetchProgress(DownloadCallbacks, Progress):
         )
 
 
-class UpgradeProgress(TransactionCallbacks, Progress):
+class UpgradeProgress(TransactionCallbacks, ReleaseUpgradeTail, Progress):
     def __init__(self, weight: int, log: Logger) -> None:
         TransactionCallbacks.__init__(self)
         Progress.__init__(self, weight, log)
+        # Armed by _distro_sync() only, so ordinary runs are unaffected.
+        ReleaseUpgradeTail.__init__(self)
         self.pgks: int | None = None
         self.pgks_done: int | None = None
         self.processed_packages: set[str] = set()
+        self.tail_reached = False
 
     def install_progress(
         self, item: libdnf5.base.TransactionPackage, amount: int, total: int
@@ -429,7 +452,7 @@ class UpgradeProgress(TransactionCallbacks, Progress):
         assert isinstance(self.pgks_done, int)
         assert isinstance(self.pgks, int)
         percent = (self.pgks_done + pkg_progress) / self.pgks * 100
-        self.notify_callback(percent)
+        self.notify_callback(self._scaled_percent(percent))
 
     def transaction_start(self, total: int) -> None:
         r"""
@@ -439,6 +462,7 @@ class UpgradeProgress(TransactionCallbacks, Progress):
         """
         self.pgks_done = 0
         self.pgks = total
+        self.tail_reached = False
 
     def uninstall_progress(
         self, item: libdnf5.base.TransactionPackage, amount: int, total: int
@@ -458,7 +482,7 @@ class UpgradeProgress(TransactionCallbacks, Progress):
         assert isinstance(self.pgks_done, int)
         assert isinstance(self.pgks, int)
         percent = (self.pgks_done + pkg_progress) / self.pgks * 100
-        self.notify_callback(percent)
+        self.notify_callback(self._scaled_percent(percent))
 
     # pylint: disable=unused-argument
     def elem_progress(
@@ -475,7 +499,7 @@ class UpgradeProgress(TransactionCallbacks, Progress):
         """
         self.pgks_done = amount
         percent = amount / total * 100
-        self.notify_callback(percent)
+        self.notify_callback(self._scaled_percent(percent))
 
     # pylint: disable=unused-argument,redefined-builtin
     def script_start(
@@ -501,3 +525,9 @@ class UpgradeProgress(TransactionCallbacks, Progress):
             f":{nevra.get_version()}-{nevra.get_release()}.{nevra.get_arch()}",
             flush=True,
         )
+        # The ~1500 scriptlets before the tail are interleaved with the
+        # package loop, which reports its own progress.
+        if type in TAIL_MARKER_TYPES:
+            self.tail_reached = True
+        if self.tail_reached:
+            self.note_tail_scriptlet()

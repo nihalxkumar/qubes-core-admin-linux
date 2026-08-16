@@ -34,7 +34,11 @@ import dnf.transaction
 
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
-from source.common.progress_reporter import ProgressReporter, Progress
+from source.common.progress_reporter import (
+    ProgressReporter,
+    Progress,
+    ReleaseUpgradeTail,
+)
 from source.common.package_manager import AgentType
 
 from .dnf_cli import DNFCLI
@@ -219,8 +223,13 @@ class DNF(DNFCLI):
                 result += sign_check(base, trans.install_set, self.log)
                 if result.code == EXIT.OK:
                     self.log.debug("Committing distro-sync to %s...", target)
+                    # Enable tail progress shaping for post-transaction scriptlets.
+                    self.progress.upgrade_progress.open_tail()
                     transaction_started = time.monotonic()
-                    base.do_transaction(self.progress.upgrade_progress)
+                    try:
+                        base.do_transaction(self.progress.upgrade_progress)
+                    finally:
+                        self.progress.upgrade_progress.close_tail()
                     self.log.debug(
                         "dnf transaction for release %s took %.3fs",
                         target,
@@ -329,10 +338,12 @@ class FetchProgress(DownloadProgress, Progress):
         self.notify_callback(0)
 
 
-class UpgradeProgress(TransactionDisplay, Progress):
+class UpgradeProgress(TransactionDisplay, ReleaseUpgradeTail, Progress):
     def __init__(self, weight: int, log: Logger) -> None:
         TransactionDisplay.__init__(self)
         Progress.__init__(self, weight, log)
+        # Armed by _distro_sync() only, so ordinary runs are unaffected.
+        ReleaseUpgradeTail.__init__(self)
 
     def progress(
         self,
@@ -354,12 +365,14 @@ class UpgradeProgress(TransactionDisplay, Progress):
         :param ts_total: total number of actions in the whole transaction
         """
         self.log.info(_package)
-        fetch = 6
-        install = 7
-        if action not in (fetch, install):
+        # libdnf TransactionItemAction values: 6 is UPGRADE, 7 is
+        # UPGRADED (the cleanup element of an upgraded package).
+        upgrade = 6
+        upgraded_cleanup = 7
+        if action not in (upgrade, upgraded_cleanup):
             return
         percent = (ti_done / ti_total + ts_done - 1) / ts_total * 100
-        self.notify_callback(percent)
+        self.notify_callback(self._scaled_percent(percent))
 
     def scriptout(self, msgs: bytes | str) -> None:
         """

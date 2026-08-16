@@ -30,7 +30,11 @@ from typing import List, Iterator, Optional
 from logging import Handler
 
 from source.utils import get_os_data
-from source.common.package_manager import PackageManager, AgentType
+from source.common.package_manager import (
+    PackageManager,
+    AgentType,
+    RELEASE_UPGRADE_ALMOST_DONE,
+)
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
 
@@ -282,7 +286,8 @@ class APTCLI(PackageManager):
             )
         result.code = EXIT.OK
 
-        self._finish_progress()
+        # version_upgrade() owns the jump to 100, after qubes.PostInstall.
+        self._report_milestone(RELEASE_UPGRADE_ALMOST_DONE)
         return result
 
     def _dist_upgrade(self) -> ProcessResult:

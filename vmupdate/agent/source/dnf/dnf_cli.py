@@ -28,7 +28,11 @@ import string
 import subprocess
 
 from source.utils import get_os_data
-from source.common.package_manager import PackageManager, AgentType
+from source.common.package_manager import (
+    PackageManager,
+    AgentType,
+    RELEASE_UPGRADE_ALMOST_DONE,
+)
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
 
@@ -243,7 +247,8 @@ class DNFCLI(PackageManager):
             result += ProcessResult(EXIT.ERR_VM_UPDATE, out="", err=msg)
             return result
 
-        self._finish_progress()
+        # version_upgrade() owns the jump to 100, after qubes.PostInstall.
+        self._report_milestone(RELEASE_UPGRADE_ALMOST_DONE)
         return result
 
     def _distro_sync(self, target: str) -> ProcessResult:

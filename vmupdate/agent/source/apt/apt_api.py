@@ -31,7 +31,11 @@ import apt_pkg
 from source.common.package_manager import AgentType
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
-from source.common.progress_reporter import ProgressReporter, Progress
+from source.common.progress_reporter import (
+    ProgressReporter,
+    Progress,
+    ReleaseUpgradeTail,
+)
 
 from .apt_cli import APTCLI
 
@@ -123,7 +127,15 @@ class APT(APTCLI):
             "APT cache reload before distribution upgrade took %.3fs",
             time.monotonic() - cache_open_started,
         )
-        return self._api_upgrade(dist_upgrade=True)
+        # dpkg still has obsolete-kernel cleanup and qubes.PostInstall
+        # after this commit, so keep the bar off 100. Unlike rpm, apt's own
+        # percent already covers configure and trigger processing, so there
+        # is no scriptlet tail to count here.
+        self.progress.upgrade_progress.open_tail()
+        try:
+            return self._api_upgrade(dist_upgrade=True)
+        finally:
+            self.progress.upgrade_progress.close_tail()
 
     def _api_upgrade(self, dist_upgrade: bool) -> ProcessResult:
         """
@@ -236,16 +248,21 @@ class FetchProgress(apt.progress.base.AcquireProgress, Progress):
         self.notify_callback(100)
 
 
-class UpgradeProgress(apt.progress.base.InstallProgress, Progress):
+class UpgradeProgress(
+    apt.progress.base.InstallProgress, ReleaseUpgradeTail, Progress
+):
     def __init__(self, weight: int, log: Logger) -> None:
         apt.progress.base.InstallProgress.__init__(self)
         Progress.__init__(self, weight, log)
+        # Armed by APT._dist_upgrade() only, so ordinary runs are
+        # unaffected.
+        ReleaseUpgradeTail.__init__(self)
 
     def status_change(self, _pkg: str, percent: float, _status: str) -> None:
         """
         Report ongoing progress on installing/upgrading packages.
         """
-        self.notify_callback(percent)
+        self.notify_callback(self._scaled_percent(percent))
 
     def error(self, pkg: str, errormsg: str) -> None:
         """
@@ -265,4 +282,4 @@ class UpgradeProgress(apt.progress.base.InstallProgress, Progress):
     def finish_update(self) -> None:
         print("Updated.", flush=True)
         super().finish_update()
-        self.notify_callback(100)
+        self.notify_callback(self._scaled_percent(100))

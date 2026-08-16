@@ -22,7 +22,7 @@
 import io
 import os
 import sys
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 from logging import Logger
 
 
@@ -84,6 +84,88 @@ class Progress:
         return f"{size:.2f} {units[-1]}"
 
 
+class ReleaseUpgradeTail:
+    """Progress shaping for post-transaction scriptlets during release upgrades.
+
+    Rescales package progress to 0..CAP, then asymptotically advances
+    from CAP to TAIL_STOP as post-transaction scriptlets execute.
+    TAIL_STOP < 100 because qubes.PostInstall still runs afterwards.
+
+    Mixin for Progress subclasses. Inert until open_tail() is called.
+    """
+
+    # Overall percent the package callbacks are rescaled to end at.
+    CAP = 90.0
+    # Overall percent the tail asymptotically approaches.
+    TAIL_STOP = 99.5
+    # Scriptlet count at which the tail band is halfway across.
+    ASYMPTOTE_HALFWAY = 25
+
+    if TYPE_CHECKING:
+        # Supplied by the Progress this mixin is combined with, declared
+        # here only for the type checker.
+        _start_percent: Optional[float]
+        _stop_percent: Optional[float]
+        log: Logger
+
+        def notify_callback(self, percent: float) -> None: ...
+
+    def __init__(self) -> None:
+        self._tail_open = False
+        self._tail_seen = 0
+        self._tail_clamp_logged = False
+
+    def open_tail(self) -> None:
+        """
+        Arm tail shaping for the transaction about to run.
+        """
+        self._tail_open = True
+        self._tail_seen = 0
+
+    def close_tail(self) -> None:
+        """
+        Disarm tail shaping.
+        """
+        self._tail_open = False
+
+    def _scaled_percent(self, local_percent: float) -> float:
+        """Rescale local phase percentage so package progress caps at CAP."""
+        if not self._tail_open:
+            return local_percent
+        cap_local = self._local_for_overall(self.CAP)
+        clamped = min(max(cap_local, 0.0), 100.0)
+        if clamped != cap_local and not self._tail_clamp_logged:
+            self._tail_clamp_logged = True
+            self.log.debug(
+                "tail CAP maps outside the phase slice (%.2f), clamping",
+                cap_local,
+            )
+        return min(local_percent, 100.0) * clamped / 100
+
+    def _local_for_overall(self, overall: float) -> float:
+        """
+        Convert an overall-bar percent into this phase's local percent.
+        """
+        assert self._start_percent is not None  # call init() first!
+        assert self._stop_percent is not None  # call init() first!
+        span = self._stop_percent - self._start_percent
+        if span <= 0:
+            return 100.0
+        return (overall - self._start_percent) / span * 100
+
+    def note_tail_scriptlet(self) -> None:
+        """
+        Advance the bar for one post-transaction scriptlet.
+        """
+        if not self._tail_open:
+            return
+        self._tail_seen += 1
+        overall = self.CAP + (self.TAIL_STOP - self.CAP) * self._tail_seen / (
+            self._tail_seen + self.ASYMPTOTE_HALFWAY
+        )
+        self.notify_callback(min(self._local_for_overall(overall), 100.0))
+
+
 class ProgressReporter:
     """
     Simple rough progress reporter.
@@ -112,9 +194,7 @@ class ProgressReporter:
             emit = callback
 
         def callback_with_memory(percent: float) -> None:
-            # Remember the highest value reported so far, so callers can
-            # tell whether the stream already reached 100 and skip a
-            # duplicate final milestone (PackageManager._finish_progress).
+            # Track highest reported progress to prevent duplicate milestones.
             self.last_percent = max(self.last_percent, percent)
             emit(percent)
 
