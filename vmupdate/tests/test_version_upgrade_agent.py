@@ -52,6 +52,7 @@ from source.apt.apt_cli import APTCLI
 from source.common.package_manager import PackageManager, AgentType
 from source.common.process_result import ProcessResult
 from source.common.exit_codes import EXIT
+from source.common.package_manager import RELEASE_UPGRADE_ALMOST_DONE
 from source.common.progress_reporter import (
     Progress,
     ProgressReporter,
@@ -192,6 +193,92 @@ def test_progress_reporter_remembers_last_reported_percent() -> None:
 
     reporter.upgrade_progress.notify_callback(100)
     assert reporter.last_percent == 100.0
+
+
+# ProgressReporter step ranges: one slice of the bar per upgrade step
+
+
+def _apt_style_reporter():
+    """Build a reporter with APT's phase weights."""
+    log = MagicMock()
+    emitted: list[float] = []
+    phases = (Progress(4, log), Progress(48, log), Progress(48, log))
+    reporter = ProgressReporter(*phases, callback=emitted.append)
+    return reporter, emitted
+
+
+def test_step_range_keeps_a_repeated_phase_off_100() -> None:
+    """APTCLI._release_upgrade runs the phases six times. Without a slice
+    per step the second one drives the bar to 100 and the monotonic guard
+    silences the remaining four."""
+    reporter, _ = _apt_style_reporter()
+    reporter.set_step_range(0.0, 20.0, installs=True)
+    # every apt commit() ends in finish_update() -> notify_callback(100)
+    reporter.upgrade_progress.notify_callback(100)
+    assert reporter.last_percent == 20.0
+
+    reporter.set_step_range(20.0, 40.0, installs=True)
+    reporter.upgrade_progress.notify_callback(100)
+    assert reporter.last_percent == 40.0
+
+
+def test_step_range_gives_the_whole_slice_to_the_active_phases() -> None:
+    """A refresh-only step drives just the update phase, whose weight is a
+    small fraction of the reporter. It still has to cross its own slice,
+    or the bar sits still for the whole apt update."""
+    reporter, _ = _apt_style_reporter()
+    reporter.set_step_range(10.0, 30.0, installs=False)
+    reporter.update_progress.notify_callback(100)
+    assert reporter.last_percent == 30.0
+
+    # an installing step splits its slice between fetch and install
+    reporter.set_step_range(30.0, 50.0, installs=True)
+    reporter.fetch_progress.notify_callback(100)
+    assert reporter.last_percent == 40.0
+    reporter.upgrade_progress.notify_callback(100)
+    assert reporter.last_percent == 50.0
+
+
+def test_apt_release_upgrade_bar_stays_below_100_throughout(
+    apt_sources, capfd
+) -> None:
+    """End to end over the real step list: the bar must climb and stop
+    short of 100 until qubes.PostInstall has run.
+
+    capfd, not capsys: ProgressReporter dups the real stdout/stderr fds.
+    """
+    mgr = make_apt_cli()
+    mgr.progress, emitted = _apt_style_reporter()
+
+    def drive_step(*_args, **_kwargs) -> ProcessResult:
+        # Stand in for a step that runs its phases to completion. Every
+        # phase is driven, including the ones the step did not claim, to
+        # prove a stale range cannot jump the bar.
+        mgr.progress.update_progress.notify_callback(100)
+        mgr.progress.fetch_progress.notify_callback(100)
+        mgr.progress.upgrade_progress.notify_callback(100)
+        return ProcessResult(EXIT.OK)
+
+    with patch.object(mgr, "refresh", side_effect=drive_step), patch.object(
+        mgr, "upgrade_internal", side_effect=drive_step
+    ), patch.object(mgr, "_dist_upgrade", side_effect=drive_step), patch.object(
+        mgr, "_rewrite_sources", side_effect=drive_step
+    ), patch.object(
+        mgr, "remove_obsolete_kernels", return_value=ProcessResult(EXIT.OK)
+    ), patch(
+        "source.apt.apt_cli.get_os_data",
+        side_effect=[
+            debian_os_data("12", "bookworm"),
+            debian_os_data("13", "trixie"),
+        ],
+    ):
+        assert mgr.version_upgrade("13") == EXIT.OK
+
+    assert emitted == sorted(emitted)
+    # the callback stream climbs to, but not past, the pre-PostInstall mark
+    assert max(emitted) == RELEASE_UPGRADE_ALMOST_DONE
+    # so the explicit milestone is redundant and only 100 is printed
+    assert capfd.readouterr().err.split() == ["0.00", "100.00"]
 
 
 # ReleaseUpgradeTail: shaping the post-transaction scriptlet tail

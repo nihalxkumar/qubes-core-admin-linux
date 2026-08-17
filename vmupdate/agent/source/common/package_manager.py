@@ -407,6 +407,16 @@ class PackageManager:
         """
         print(f"{percent:.2f}", flush=True, file=sys.stderr)
 
+    def _set_progress_step(
+        self, start: float, stop: float, installs: bool
+    ) -> None:
+        """
+        Claim `start`..`stop` for the next step, if the backend reports.
+        """
+        progress = getattr(self, "progress", None)
+        if progress is not None:
+            progress.set_step_range(start, stop, installs)
+
     def _report_milestone(self, percent: float) -> None:
         """
         Report `percent` unless callback progress already passed it.

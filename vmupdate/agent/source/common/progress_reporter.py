@@ -144,7 +144,10 @@ class ReleaseUpgradeTail:
 
     def _local_for_overall(self, overall: float) -> float:
         """
-        Convert an overall-bar percent into this phase's local percent.
+        Convert a reporter-scale percent into this phase's local percent.
+
+        ProgressReporter.set_step_range() may narrow the phase, so the
+        bands are relative to the phase's current slice of the bar.
         """
         assert self._start_percent is not None  # call init() first!
         assert self._stop_percent is not None  # call init() first!
@@ -213,3 +216,32 @@ class ProgressReporter:
         self.update_progress = update
         self.fetch_progress = fetch
         self.upgrade_progress = upgrade
+
+    def set_step_range(
+        self, start: float, stop: float, installs: bool
+    ) -> None:
+        """Allocate a progress range to one release-upgrade step."""
+        active = (
+            (self.fetch_progress, self.upgrade_progress)
+            if installs
+            else (self.update_progress,)
+        )
+        total = sum(phase.weight for phase in active)
+        at = start
+        for phase in active:
+            # With all active weights zero, split the slice evenly rather
+            # than collapsing every phase to a zero-width range.
+            share = phase.weight / total if total else 1 / len(active)
+            span = (stop - start) * share
+            phase.init(at, at + span, self.callback, self.stdout, self.stderr)
+            at += span
+        # Reset inactive phases to start so they don't emit stale progress.
+        for phase in (
+            self.update_progress,
+            self.fetch_progress,
+            self.upgrade_progress,
+        ):
+            if phase not in active:
+                phase.init(
+                    start, start, self.callback, self.stdout, self.stderr
+                )

@@ -240,15 +240,31 @@ class APTCLI(PackageManager):
 
         # Update before switching sources and running dist-upgrade: a stale
         # system risks unresolvable transactions across the release boundary.
+        # Each step gets its own slice of the bar, weighted by its share of
+        # a measured debian-12 to 13 template upgrade; without that, every
+        # step drives the same three-phase reporter to 100 in turn.
+        # (bar weight, drives fetch/install phases, step)
         steps = (
-            lambda: self.refresh(hard_fail=True),
-            lambda: self.upgrade_internal(remove_obsolete=False),
-            lambda: self._rewrite_sources(old_codename, new_codename),
-            lambda: self.refresh(hard_fail=True),
-            lambda: self.upgrade_internal(remove_obsolete=False),
-            self._dist_upgrade,
+            (7, False, lambda: self.refresh(hard_fail=True)),
+            (7, True, lambda: self.upgrade_internal(remove_obsolete=False)),
+            (
+                1,
+                False,
+                lambda: self._rewrite_sources(old_codename, new_codename),
+            ),
+            (9, False, lambda: self.refresh(hard_fail=True)),
+            (22, True, lambda: self.upgrade_internal(remove_obsolete=False)),
+            (54, True, self._dist_upgrade),
         )
-        for step in steps:
+        total = sum(weight for weight, _, _ in steps)
+        done = 0
+        for weight, installs, step in steps:
+            self._set_progress_step(
+                done / total * RELEASE_UPGRADE_ALMOST_DONE,
+                (done + weight) / total * RELEASE_UPGRADE_ALMOST_DONE,
+                installs,
+            )
+            done += weight
             step_result = step()
             result += step_result
             if step_result.code:
