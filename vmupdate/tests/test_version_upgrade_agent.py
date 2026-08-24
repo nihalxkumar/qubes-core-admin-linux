@@ -239,6 +239,49 @@ def test_step_range_gives_the_whole_slice_to_the_active_phases() -> None:
     assert reporter.last_percent == 50.0
 
 
+def _zero_weight_reporter():
+    """Build a reporter whose phases all weigh nothing.
+
+    ProgressReporter.__init__ normalizes phase weights, so it cannot be
+    constructed directly at total weight 0; start from a valid reporter
+    and flatten the weights to reach set_step_range's degenerate case.
+    """
+    log = MagicMock()
+    emitted: list[float] = []
+    phases = (Progress(4, log), Progress(48, log), Progress(48, log))
+    reporter = ProgressReporter(*phases, callback=emitted.append)
+    for phase in phases:
+        phase.weight = 0
+    return reporter
+
+
+def test_step_range_splits_evenly_when_all_weights_are_zero() -> None:
+    """A degenerate reporter whose active phases all weigh nothing must
+    still hand out the slice: split it evenly instead of collapsing every
+    phase to a zero-width range at the slice start."""
+    reporter = _zero_weight_reporter()
+
+    reporter.set_step_range(10.0, 30.0, installs=True)
+    # update is collapsed onto the slice start and must stay silent,
+    # while fetch and upgrade split 10..30 evenly
+    reporter.update_progress.notify_callback(100)
+    assert reporter.last_percent == 0.0
+    reporter.fetch_progress.notify_callback(100)
+    assert reporter.last_percent == 20.0
+    reporter.upgrade_progress.notify_callback(100)
+    assert reporter.last_percent == 30.0
+
+
+def test_step_range_gives_whole_slice_to_a_single_zero_weight_phase() -> None:
+    """Same even-split rule for a refresh-only step over a zero-weight
+    update phase: the phase gets the entire slice."""
+    reporter = _zero_weight_reporter()
+
+    reporter.set_step_range(10.0, 30.0, installs=False)
+    reporter.update_progress.notify_callback(100)
+    assert reporter.last_percent == 30.0
+
+
 def test_apt_release_upgrade_bar_stays_below_100_throughout(
     apt_sources, capfd
 ) -> None:
@@ -279,6 +322,62 @@ def test_apt_release_upgrade_bar_stays_below_100_throughout(
     assert max(emitted) == RELEASE_UPGRADE_ALMOST_DONE
     # so the explicit milestone is redundant and only 100 is printed
     assert capfd.readouterr().err.split() == ["0.00", "100.00"]
+
+
+def test_apt_release_upgrade_step_slices_match_the_measured_weights(
+    apt_sources,
+) -> None:
+    """Pin each step's slice of the bar: the weights are 7/7/1/9/22/54
+    (shares of a measured debian-12 to 13 upgrade), scaled into
+    0..RELEASE_UPGRADE_ALMOST_DONE."""
+    mgr = make_apt_cli()
+    recorded: list[tuple[float, float, bool]] = []
+
+    def drive_step(*_args, **_kwargs) -> ProcessResult:
+        return ProcessResult(EXIT.OK)
+
+    with patch.object(
+        mgr, "_set_progress_step", side_effect=lambda *a: recorded.append(a)
+    ), patch.object(mgr, "refresh", side_effect=drive_step), patch.object(
+        mgr, "upgrade_internal", side_effect=drive_step
+    ), patch.object(mgr, "_dist_upgrade", side_effect=drive_step), patch.object(
+        mgr, "_rewrite_sources", side_effect=drive_step
+    ), patch.object(
+        mgr, "remove_obsolete_kernels", return_value=ProcessResult(EXIT.OK)
+    ), patch(
+        "source.apt.apt_cli.get_os_data",
+        side_effect=[
+            debian_os_data("12", "bookworm"),
+            debian_os_data("13", "trixie"),
+        ],
+    ):
+        assert mgr.version_upgrade("13") == EXIT.OK
+
+    weights = (
+        (7, False),  # refresh before switching sources
+        (7, True),  # upgrade current release fully
+        (1, False),  # rewrite codename across apt sources
+        (9, False),  # refresh onto the new release
+        (22, True),  # upgrade onto the new release
+        (54, True),  # dist-upgrade across the release boundary
+    )
+    expected = []
+    done = 0
+    for weight, installs in weights:
+        start = done / 100 * RELEASE_UPGRADE_ALMOST_DONE
+        stop = (done + weight) / 100 * RELEASE_UPGRADE_ALMOST_DONE
+        expected.append((start, stop, installs))
+        done += weight
+
+    assert len(recorded) == len(expected) == 6
+    for (got_start, got_stop, got_installs), (
+        want_start,
+        want_stop,
+        want_installs,
+    ) in zip(recorded, expected):
+        assert got_start == pytest.approx(want_start)
+        assert got_stop == pytest.approx(want_stop)
+        assert got_installs == want_installs
 
 
 # ReleaseUpgradeTail: shaping the post-transaction scriptlet tail
@@ -1080,6 +1179,19 @@ def debian_os_data(release="12", codename="bookworm") -> dict[str, str]:
         "release": release,
         "codename": codename,
     }
+
+
+# PACMANCLI release-upgrade refusal (Arch is a rolling release)
+
+
+def test_pacman_release_upgrade_refuses() -> None:
+    """--version-upgrade on an Arch template must fail loudly rather than
+    fall through to the generic update path."""
+    from source.pacman.pacman_cli import PACMANCLI
+
+    mgr = PACMANCLI(logging.NullHandler(), logging.DEBUG, AgentType.VM)
+    with pytest.raises(NotImplementedError):
+        mgr._release_upgrade("rolling")
 
 
 # APTCLI in-qube guard (single-step, current codename must be present)

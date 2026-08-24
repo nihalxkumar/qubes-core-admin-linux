@@ -312,13 +312,13 @@ class TemplateUpgrader:
         self.args = args
         self.log = log
         # Set by validate() before use.
-        self.source_vm: qubesadmin.vm.QubesVM = None
+        self.source_vm: Optional[qubesadmin.vm.QubesVM] = None
         self.distro = ""
         self.current_version = ""
         self.target_version = ""
         self.new_name = ""
         # Set by clone() for rollback.
-        self.cloned_qube: qubesadmin.vm.QubesVM = None
+        self.cloned_qube: Optional[qubesadmin.vm.QubesVM] = None
 
     # validation
 
@@ -354,6 +354,7 @@ class TemplateUpgrader:
         return vm
 
     def _detect_distro(self) -> Tuple[str, str]:
+        assert self.source_vm is not None  # set by validate()
         distro = self.source_vm.features.get("os-distribution")
         distro_like = self.source_vm.features.get("os-distribution-like", "")
         version = self.source_vm.features.get("os-version")
@@ -385,6 +386,7 @@ class TemplateUpgrader:
         )
 
     def describe_plan(self) -> str:
+        assert self.source_vm is not None  # set by validate()
         return (
             f"upgrade {self.source_vm.name} "
             f"({self.distro} {self.current_version}) -> "
@@ -396,6 +398,7 @@ class TemplateUpgrader:
 
     def clone(self) -> None:
         """Clone the source qube. Populates self.cloned_qube."""
+        assert self.source_vm is not None  # set by validate()
         self.log.info("Cloning %s -> %s", self.source_vm.name, self.new_name)
         self.cloned_qube = self.app.clone_vm(self.source_vm, self.new_name)
 
@@ -406,6 +409,7 @@ class TemplateUpgrader:
         The upgrade briefly holds both releases' packages, which can
         trip the 90% threshold. This may bring unnecesarry panic for users.
         """
+        assert self.cloned_qube is not None  # set by clone()
         try:
             prior = self.cloned_qube.features.get(DISK_SPACE_NOTIFY_FEATURE)
             self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE] = "1"
@@ -430,6 +434,7 @@ class TemplateUpgrader:
 
     def run_agent(self) -> None:
         """Run the version-upgrade agent inside the clone."""
+        assert self.cloned_qube is not None  # set by clone()
         agent_args = self._build_agent_args()
         # Print the milestone before creating the progress bar.
         self.log.info(
@@ -485,6 +490,8 @@ class TemplateUpgrader:
 
     def finalize(self) -> None:
         """Refresh metadata for an upgraded TemplateVM."""
+        assert self.cloned_qube is not None  # set by clone()
+        assert self.source_vm is not None  # set by validate()
         # The in-VM agent verified the new release; make sure dom0 metadata
         # reflects it even if qubes.PostInstall's feature refresh failed.
         if self.cloned_qube.features.get("os-version") != self.target_version:
@@ -557,9 +564,12 @@ def main(
 
     log.info("Plan: %s", upgrader.describe_plan())
 
+    source_vm = upgrader.source_vm
+    assert source_vm is not None  # set by validate()
+
     if args.dry_run:
         print(
-            f"[dry-run] would clone {upgrader.source_vm.name} -> "
+            f"[dry-run] would clone {source_vm.name} -> "
             f"{upgrader.new_name} and upgrade {upgrader.distro} "
             f"{upgrader.current_version} -> {upgrader.target_version}"
         )
@@ -571,6 +581,8 @@ def main(
         except qubesadmin.exc.QubesException as err:
             print(f"error: clone failed: {err}", file=sys.stderr)
             return EXIT.ERR
+        cloned_qube = upgrader.cloned_qube
+        assert cloned_qube is not None  # set by clone()
 
         try:
             upgrader.run_agent()
@@ -581,7 +593,7 @@ def main(
             else:
                 log.info(
                     "Leaving clone %s in place (--keep-new-on-failure).",
-                    upgrader.cloned_qube.name,
+                    cloned_qube.name,
                 )
             print(f"error: {err}", file=sys.stderr)
             return EXIT.ERR
@@ -592,15 +604,15 @@ def main(
         except qubesadmin.exc.QubesException as err:
             log.warning("Could not write post-upgrade features: %s", err)
             print(
-                f"warning: {upgrader.cloned_qube.name} was upgraded, but "
+                f"warning: {cloned_qube.name} was upgraded, but "
                 f"writing its template-* features failed: {err}. Set them "
                 f"manually with qvm-features.",
                 file=sys.stderr,
             )
 
-        label = upgrader.cloned_qube.klass.lower().removesuffix("vm")
-        print(f"Upgrade complete. New {label}: {upgrader.cloned_qube.name}")
-        print(f"Original qube {upgrader.source_vm.name} is untouched.")
+        label = cloned_qube.klass.lower().removesuffix("vm")
+        print(f"Upgrade complete. New {label}: {cloned_qube.name}")
+        print(f"Original qube {source_vm.name} is untouched.")
         return EXIT.OK
     except KeyboardInterrupt:
         log.error("Interrupted; clone %s may remain.", upgrader.new_name)
