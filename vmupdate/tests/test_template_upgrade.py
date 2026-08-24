@@ -324,9 +324,7 @@ def test_upgraded_template_keeps_every_feature_qvm_template_reads(
     ):
         assert required in features, required
     # qvm-template parses this one with strptime(DATE_FMT).
-    datetime.strptime(
-        features["template-buildtime"], template_upgrade.DATE_FMT
-    )
+    datetime.strptime(features["template-buildtime"], template_upgrade.DATE_FMT)
 
 
 def test_custom_template_description_left_untouched(monkeypatch) -> None:
@@ -355,9 +353,7 @@ def test_standalone_without_template_name_left_alone(
         template_upgrade.TemplateUpgrader, "run_agent", lambda self: None
     )
 
-    retcode = template_upgrade.main(
-        ["--template", "fedora-41-standalone"], app
-    )
+    retcode = template_upgrade.main(["--template", "fedora-41-standalone"], app)
 
     assert retcode == EXIT.OK
     assert (
@@ -381,9 +377,7 @@ def test_standalone_template_name_left_untouched(monkeypatch) -> None:
         template_upgrade.TemplateUpgrader, "run_agent", lambda self: None
     )
 
-    retcode = template_upgrade.main(
-        ["--template", "fedora-41-standalone"], app
-    )
+    retcode = template_upgrade.main(["--template", "fedora-41-standalone"], app)
 
     assert retcode == EXIT.OK
     clone = app.domains["fedora-42-standalone"]
@@ -653,9 +647,7 @@ def test_setup_logging_is_idempotent(tmp_path, monkeypatch) -> None:
     assert log2.propagate is False
 
 
-def test_setup_logging_tolerates_missing_log_dir(
-    tmp_path, monkeypatch
-) -> None:
+def test_setup_logging_tolerates_missing_log_dir(tmp_path, monkeypatch) -> None:
     """A missing log directory degrades to stderr-only, not a crash."""
     monkeypatch.setattr(template_upgrade, "setup_logging", _REAL_SETUP_LOGGING)
     monkeypatch.setattr(
@@ -676,9 +668,7 @@ def test_setup_logging_tolerates_missing_log_dir(
     )
 
 
-def test_setup_logging_agent_logger_is_file_only(
-    tmp_path, monkeypatch
-) -> None:
+def test_setup_logging_agent_logger_is_file_only(tmp_path, monkeypatch) -> None:
     """Agent output logger should only write to file, not stderr."""
     monkeypatch.setattr(template_upgrade, "setup_logging", _REAL_SETUP_LOGGING)
     monkeypatch.setattr(
@@ -708,9 +698,7 @@ def test_agent_output_logs_progress_ticks_at_debug() -> None:
     sink.put(StatusInfo.updating(qube, 42.5))
     sink.put(FormatedLine("fedora-42-xfce", "out", "hello"))
 
-    log.debug.assert_called_once_with(
-        "%s progress: %s", "fedora-42-xfce", 42.5
-    )
+    log.debug.assert_called_once_with("%s progress: %s", "fedora-42-xfce", 42.5)
     log.info.assert_called_once()
 
 
@@ -810,9 +798,7 @@ def test_lines_stream_to_stdout_while_ticks_drive_the_bar(capsys) -> None:
         sink.put(StatusInfo.updating(qube, float(i + 1)))
         for j in range(lines_per_tick):
             sink.put(
-                FormatedLine(
-                    "fedora-42-xfce", "out", f"Installing pkg-{i}-{j}"
-                )
+                FormatedLine("fedora-42-xfce", "out", f"Installing pkg-{i}-{j}")
             )
     sink.close()
 

@@ -217,9 +217,7 @@ class ProgressReporter:
         self.fetch_progress = fetch
         self.upgrade_progress = upgrade
 
-    def set_step_range(
-        self, start: float, stop: float, installs: bool
-    ) -> None:
+    def set_step_range(self, start: float, stop: float, installs: bool) -> None:
         """Allocate a progress range to one release-upgrade step."""
         active = (
             (self.fetch_progress, self.upgrade_progress)

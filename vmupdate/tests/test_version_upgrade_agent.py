@@ -340,7 +340,9 @@ def test_apt_release_upgrade_step_slices_match_the_measured_weights(
         mgr, "_set_progress_step", side_effect=lambda *a: recorded.append(a)
     ), patch.object(mgr, "refresh", side_effect=drive_step), patch.object(
         mgr, "upgrade_internal", side_effect=drive_step
-    ), patch.object(mgr, "_dist_upgrade", side_effect=drive_step), patch.object(
+    ), patch.object(
+        mgr, "_dist_upgrade", side_effect=drive_step
+    ), patch.object(
         mgr, "_rewrite_sources", side_effect=drive_step
     ), patch.object(
         mgr, "remove_obsolete_kernels", return_value=ProcessResult(EXIT.OK)
@@ -1105,6 +1107,7 @@ def test_dnf5_expect_bytes_ignores_a_useless_estimate() -> None:
     assert progress.download_total == 400.0
 
     progress.expect_bytes(100.0)  # an estimate below what we can see
+    progress.add_new_download(None, "pkg", 400.0)
     assert progress.download_total == 400.0
 
 

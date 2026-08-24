@@ -213,9 +213,7 @@ def derive_clone_name(
         return f"{source_name}-{target_version}"
     last = matches[-1]
     return (
-        source_name[: last.start()]
-        + target_version
-        + source_name[last.end() :]
+        source_name[: last.start()] + target_version + source_name[last.end() :]
     )
 
 
@@ -424,9 +422,7 @@ class TemplateUpgrader:
                 if prior is None:
                     del self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE]
                 else:
-                    self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE] = (
-                        prior
-                    )
+                    self.cloned_qube.features[DISK_SPACE_NOTIFY_FEATURE] = prior
             except (KeyError, qubesadmin.exc.QubesException) as err:
                 self.log.warning(
                     "could not restore disk space warning: %s", err
