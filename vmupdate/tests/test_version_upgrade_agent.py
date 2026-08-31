@@ -1021,6 +1021,9 @@ def test_dnf5_api_distro_sync_reports_preparation_phase(capsys) -> None:
     base.get_repo_sack.return_value = repo_sack
 
     transaction = MagicMock()
+    transaction.get_problems.return_value = (
+        dnf5_api.libdnf5.base.GoalProblem_NO_PROBLEM
+    )
     transaction.get_transaction_packages_count.return_value = 1
     transaction.check_gpg_signatures.return_value = True
     transaction.run.return_value = transaction.TransactionRunResult_SUCCESS
@@ -1050,6 +1053,41 @@ def test_dnf5_api_distro_sync_reports_preparation_phase(capsys) -> None:
     repo_sack.load_repos.assert_called_once()
     transaction.download.assert_called_once()
     transaction.run.assert_called_once()
+
+
+def test_dnf5_api_distro_sync_reports_resolution_failure() -> None:
+    """A failed solve with no transaction packages is an error, not a no-op."""
+    dnf5_api = pytest.importorskip("source.dnf.dnf5_api")
+    mgr = dnf5_api.DNF5.__new__(dnf5_api.DNF5)
+    mgr.progress = MagicMock()
+    mgr.log = MagicMock()
+
+    base = MagicMock()
+    transaction = MagicMock()
+    transaction.get_problems.return_value = (
+        dnf5_api.libdnf5.base.GoalProblem_SOLVER_ERROR
+    )
+    transaction.get_resolve_logs_as_strings.return_value = [
+        "installed rpmfusion-free-release requires system-release(43)"
+    ]
+    transaction.get_transaction_packages_count.return_value = 0
+    goal = MagicMock()
+    goal.resolve.return_value = transaction
+
+    with patch.object(
+        dnf5_api.libdnf5.base, "Base", return_value=base
+    ), patch.object(
+        dnf5_api.libdnf5.repo, "DownloadCallbacksUniquePtr"
+    ), patch.object(
+        dnf5_api, "Goal", return_value=goal
+    ):
+        result = mgr._distro_sync("44")
+
+    assert result.code == EXIT.ERR_VM_UPDATE
+    assert "Failed to resolve the distro-sync transaction" in result.err
+    assert "rpmfusion-free-release" in result.err
+    transaction.download.assert_not_called()
+    transaction.run.assert_not_called()
 
 
 def test_dnf5_fetch_progress_tolerates_unknown_sizes(capsys) -> None:

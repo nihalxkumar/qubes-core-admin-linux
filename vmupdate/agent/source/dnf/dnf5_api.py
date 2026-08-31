@@ -217,6 +217,17 @@ class DNF5(DNFCLI):
             # fill empty `Command line` column in dnf history
             transaction.set_description("qubes-vm-update")
 
+            if (
+                transaction.get_problems()
+                != libdnf5.base.GoalProblem_NO_PROBLEM
+            ):
+                logs = transaction.get_resolve_logs_as_strings()
+                details = "\n".join(logs)
+                message = "Failed to resolve the distro-sync transaction."
+                if details:
+                    message += f"\n{details}"
+                raise TransactionError(message)
+
             if transaction.get_transaction_packages_count() == 0:
                 self.log.info("Distro-sync found nothing to do.")
                 return result
