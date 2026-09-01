@@ -61,9 +61,9 @@ from source.common.progress_reporter import (
 from source.args import AgentArgs
 
 
-def _expected_sync_cmd(target) -> tuple[str, ...]:
+def _expected_sync_cmd(package_manager: str, target: str) -> tuple[str, ...]:
     return (
-        "dnf",
+        package_manager,
         f"--releasever={target}",
         "distro-sync",
         "--best",
@@ -121,9 +121,9 @@ def test_version_upgrade_runs_clean_then_distro_sync() -> None:
 
     assert code == EXIT.OK
     # Old-release cache is wiped (captured, not streamed) before the bump.
-    assert calls[0] == (("dnf", "clean", "all"), False)
+    assert calls[0] == ((mgr.package_manager, "clean", "all"), False)
     sync_cmd, sync_realtime = calls[1]
-    assert sync_cmd == _expected_sync_cmd("42")
+    assert sync_cmd == _expected_sync_cmd(mgr.package_manager, "42")
     # distro-sync streams in real time so dom0 sees live output.
     assert sync_realtime is True
 
@@ -523,7 +523,7 @@ def test_version_upgrade_release_bump_goes_through_distro_sync_seam() -> None:
     assert seam_calls == ["42"]
     # only the cache wipe still goes through run_cmd
     assert [tuple(c.args[0]) for c in run_cmd.call_args_list] == [
-        ("dnf", "clean", "all")
+        (mgr.package_manager, "clean", "all")
     ]
 
 
@@ -594,7 +594,7 @@ def test_version_upgrade_bails_when_clean_fails() -> None:
 
     assert code == EXIT.ERR_VM_UPDATE
     # distro-sync is never attempted once the cache wipe fails.
-    assert calls == [("dnf", "clean", "all")]
+    assert calls == [(mgr.package_manager, "clean", "all")]
 
 
 def test_version_upgrade_maps_distro_sync_failure() -> None:
@@ -1055,7 +1055,7 @@ def test_dnf5_api_distro_sync_reports_preparation_phase(capsys) -> None:
     transaction.run.assert_called_once()
 
 
-def test_dnf5_api_distro_sync_reports_resolution_failure() -> None:
+def test_dnf5_api_distro_sync_reports_resolution_failure(capsys) -> None:
     """A failed solve with no transaction packages is an error, not a no-op."""
     dnf5_api = pytest.importorskip("source.dnf.dnf5_api")
     mgr = dnf5_api.DNF5.__new__(dnf5_api.DNF5)
@@ -1084,6 +1084,7 @@ def test_dnf5_api_distro_sync_reports_resolution_failure() -> None:
         result = mgr._distro_sync("44")
 
     assert result.code == EXIT.ERR_VM_UPDATE
+    assert "Failed to resolve package dependencies" in capsys.readouterr().out
     assert "Failed to resolve the distro-sync transaction" in result.err
     assert "rpmfusion-free-release" in result.err
     transaction.download.assert_not_called()

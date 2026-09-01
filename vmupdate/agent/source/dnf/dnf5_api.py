@@ -226,6 +226,11 @@ class DNF5(DNFCLI):
                 message = "Failed to resolve the distro-sync transaction."
                 if details:
                     message += f"\n{details}"
+                print(
+                    "Failed to resolve package dependencies; "
+                    "see the log for details.",
+                    flush=True,
+                )
                 raise TransactionError(message)
 
             if transaction.get_transaction_packages_count() == 0:
